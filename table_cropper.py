@@ -103,6 +103,7 @@ class AdvancedTableCropper:
     def detect_and_correct_rotation(self, image):
         """
         Detect rotation angle using Hough Transform and correct the image orientation.
+        Uses multiple methods for robust detection.
         
         Args:
             image: OpenCV image (BGR format)
@@ -114,63 +115,102 @@ class AdvancedTableCropper:
         # Convert to grayscale
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         
-        # Apply Gaussian blur to reduce noise
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        # Apply adaptive thresholding for better line detection on documents
+        # This helps with documents that have varying lighting
+        thresh = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2
+        )
         
-        # Edge detection
+        # Also try with Canny edge detection
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         edges = cv2.Canny(blurred, 50, 150, apertureSize=3)
         
-        # Use Hough Transform to detect lines
-        # Parameters: rho=1, theta=pi/180, threshold=100
-        lines = cv2.HoughLines(edges, 1, np.pi / 180, threshold=100)
+        # Combine both methods
+        combined = cv2.bitwise_or(thresh, edges)
         
-        if lines is None or len(lines) == 0:
+        # Use HoughLinesP (probabilistic) - better for detecting line segments
+        # Lower threshold for better detection
+        lines = cv2.HoughLinesP(combined, 1, np.pi / 180, threshold=50, 
+                                minLineLength=min(image.shape[0], image.shape[1]) // 10,
+                                maxLineGap=20)
+        
+        angles = []
+        
+        if lines is not None and len(lines) > 0:
+            # Calculate angles from line segments
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                
+                # Calculate angle of the line
+                if x2 - x1 != 0:
+                    angle_rad = np.arctan2(y2 - y1, x2 - x1)
+                    angle_deg = np.degrees(angle_rad)
+                else:
+                    # Vertical line
+                    angle_deg = 90.0
+                
+                # Normalize to -90 to 90 degrees
+                if angle_deg > 90:
+                    angle_deg = angle_deg - 180
+                elif angle_deg < -90:
+                    angle_deg = angle_deg + 180
+                
+                # Focus on near-horizontal lines (table rows) - angles close to 0
+                if abs(angle_deg) < 45:
+                    angles.append(angle_deg)
+                # Also consider near-vertical lines (table columns) - convert to horizontal
+                elif abs(angle_deg) > 45:
+                    # Convert vertical to horizontal equivalent
+                    if angle_deg > 0:
+                        angles.append(angle_deg - 90)
+                    else:
+                        angles.append(angle_deg + 90)
+        
+        # Fallback: Try standard HoughLines if HoughLinesP didn't work well
+        if len(angles) < 5:
+            lines_standard = cv2.HoughLines(combined, 1, np.pi / 180, threshold=50)
+            if lines_standard is not None and len(lines_standard) > 0:
+                for line in lines_standard:
+                    rho, theta = line[0]
+                    angle_deg = np.degrees(theta)
+                    
+                    # Normalize angle
+                    if angle_deg > 90:
+                        angle_deg = angle_deg - 180
+                    elif angle_deg < -90:
+                        angle_deg = angle_deg + 180
+                    
+                    if abs(angle_deg) < 45:
+                        angles.append(angle_deg)
+                    elif abs(angle_deg) > 45:
+                        if angle_deg > 0:
+                            angles.append(angle_deg - 90)
+                        else:
+                            angles.append(angle_deg + 90)
+        
+        if len(angles) == 0:
             print("No lines detected, returning original image")
             return image, 0.0
         
-        # Calculate angles of detected lines
-        angles = []
-        for line in lines:
-            rho, theta = line[0]
-            # Convert theta to degrees
-            angle_deg = np.degrees(theta)
-            
-            # Normalize angle to -90 to 90 degrees range
-            if angle_deg > 90:
-                angle_deg = angle_deg - 180
-            elif angle_deg < -90:
-                angle_deg = angle_deg + 180
-            
-            # Focus on near-horizontal lines (for table rows) and near-vertical lines (for table columns)
-            # We're interested in small angles (close to 0 or 90 degrees)
-            if abs(angle_deg) < 45:  # Horizontal lines
-                angles.append(angle_deg)
-            elif abs(angle_deg) > 45:  # Vertical lines, convert to horizontal equivalent
-                angles.append(angle_deg - 90 if angle_deg > 0 else angle_deg + 90)
-        
-        if len(angles) == 0:
-            print("No valid angles detected, returning original image")
-            return image, 0.0
-        
-        # Calculate median angle (more robust than mean for outliers)
+        # Calculate median angle (more robust than mean)
         angles_array = np.array(angles)
         median_angle = np.median(angles_array)
         
-        # Filter out angles that are too large (likely noise)
-        # Only consider angles between -10 and 10 degrees
-        filtered_angles = angles_array[np.abs(angles_array) < 10]
+        # Filter out extreme outliers (more than 15 degrees)
+        filtered_angles = angles_array[np.abs(angles_array) < 15]
         
         if len(filtered_angles) > 0:
+            # Use median of filtered angles
             rotation_angle = np.median(filtered_angles)
         else:
-            rotation_angle = median_angle if abs(median_angle) < 10 else 0.0
+            rotation_angle = median_angle if abs(median_angle) < 15 else 0.0
         
-        # Only rotate if the angle is significant (more than 0.5 degrees)
-        if abs(rotation_angle) < 0.5:
+        # Only rotate if the angle is significant (more than 0.3 degrees)
+        if abs(rotation_angle) < 0.3:
             print(f"Rotation angle too small ({rotation_angle:.2f}°), skipping rotation")
             return image, 0.0
         
-        print(f"Detected rotation angle: {rotation_angle:.2f} degrees")
+        print(f"Detected rotation angle: {rotation_angle:.2f} degrees (from {len(angles)} detected lines)")
         
         # Get image center
         h, w = image.shape[:2]
