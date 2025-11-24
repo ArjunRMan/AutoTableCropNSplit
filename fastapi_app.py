@@ -207,5 +207,70 @@ async def split_image_halves(
         raise HTTPException(status_code=500, detail=f"Split failed: {str(exc)}")
 
 
+@app.post("/api/upload-to-tmpfiles")
+async def upload_image_to_tmpfiles(
+    image: UploadFile | None = File(None),
+    image_url: str | None = Form(None),
+):
+    """
+    API 3: Accept a manually cropped image (either file upload or URL) and upload it to tmpfiles.org,
+    returning the public URL as JSON. This endpoint simply stores the image without any processing.
+    """
+    try:
+        file_bytes: bytes | None = None
+
+        # Accept either an uploaded file or a URL to download
+        if image is not None:
+            _validate_image_content_type(image)
+            file_bytes = await image.read()
+            if not file_bytes:
+                raise HTTPException(status_code=400, detail="Empty file uploaded")
+            original_name = image.filename or "uploaded.png"
+        elif image_url:
+            try:
+                # Ensure tmpfiles links are direct download
+                url = image_url
+                if url.startswith("http://"):
+                    url = url.replace("http://", "https://")
+                if "tmpfiles.org" in url and "/dl/" not in url:
+                    url = url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
+
+                resp = requests.get(url, timeout=30)
+                if resp.status_code != 200:
+                    raise HTTPException(status_code=400, detail=f"Failed to download image: HTTP {resp.status_code}")
+                file_bytes = resp.content
+                # Derive a name from the URL
+                original_name = os.path.basename(url.split("?")[0] or "downloaded.png")
+                if not original_name:
+                    original_name = "downloaded.png"
+            except HTTPException:
+                raise
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=f"Failed to download image from URL: {str(exc)}")
+        else:
+            raise HTTPException(status_code=400, detail="Provide either 'image' file or 'image_url' form field")
+
+        # Convert image to PNG bytes for consistent format
+        pil_img = Image.open(io.BytesIO(file_bytes))
+        png_bytes = _pil_to_png_bytes(pil_img)
+
+        # File naming based on original name
+        name_base, _ = os.path.splitext(os.path.basename(original_name))
+        filename = f"{name_base}_uploaded.png"
+
+        url = upload_to_tmpfiles(png_bytes, filename)
+
+        return JSONResponse({
+            "status": "success",
+            "filename": filename,
+            "url": url
+        })
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(exc)}")
+
+
 # For local running: `uvicorn fastapi_app:app --host 127.0.0.1 --port 8000 --reload`
 
