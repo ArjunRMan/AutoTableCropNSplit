@@ -70,10 +70,10 @@ async def _process_with_cropper(file_bytes: bytes) -> Tuple[dict, str]:
         return result, base_name
 
 
-def upload_to_tmpfiles(image_bytes: bytes, filename: str) -> str:
+def upload_to_tmpfiles(image_bytes: bytes, filename: str, content_type: str = "image/png") -> str:
     """Upload image to tmpfiles.org and return the public URL"""
     try:
-        files = {"file": (filename, image_bytes, "image/png")}
+        files = {"file": (filename, image_bytes, content_type)}
         response = requests.post("https://tmpfiles.org/api/v1/upload", files=files)
         if response.status_code == 200:
             data = response.json()
@@ -250,15 +250,31 @@ async def upload_image_to_tmpfiles(
         else:
             raise HTTPException(status_code=400, detail="Provide either 'image' file or 'image_url' form field")
 
-        # Convert image to PNG bytes for consistent format
-        pil_img = Image.open(io.BytesIO(file_bytes))
-        png_bytes = _pil_to_png_bytes(pil_img)
+        # Determine content type from original file
+        content_type = "image/png"  # default
+        if image is not None and image.content_type:
+            content_type = image.content_type
+        elif image_url:
+            # Try to determine from URL extension
+            url_lower = image_url.lower()
+            if url_lower.endswith('.jpg') or url_lower.endswith('.jpeg'):
+                content_type = "image/jpeg"
+            elif url_lower.endswith('.png'):
+                content_type = "image/png"
+            elif url_lower.endswith('.gif'):
+                content_type = "image/gif"
+            elif url_lower.endswith('.bmp'):
+                content_type = "image/bmp"
+            elif url_lower.endswith('.webp'):
+                content_type = "image/webp"
 
-        # File naming based on original name
-        name_base, _ = os.path.splitext(os.path.basename(original_name))
-        filename = f"{name_base}_uploaded.png"
+        # Preserve original filename (no conversion, no processing)
+        filename = os.path.basename(original_name)
+        if not filename:
+            filename = "uploaded.png"
 
-        url = upload_to_tmpfiles(png_bytes, filename)
+        # Upload raw image bytes directly to tmpfiles (no processing)
+        url = upload_to_tmpfiles(file_bytes, filename, content_type)
 
         return JSONResponse({
             "status": "success",
