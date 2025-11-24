@@ -12,6 +12,8 @@ from starlette.responses import Response
 
 from PIL import Image
 import requests
+import cv2
+import numpy as np
 
 # Ensure project root is on path to import table_cropper
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -70,6 +72,42 @@ async def _process_with_cropper(file_bytes: bytes) -> Tuple[dict, str]:
         return result, base_name
 
 
+def apply_rotation_correction(file_bytes: bytes) -> bytes:
+    """
+    Apply rotation correction to image bytes using Hough Transform.
+    
+    Args:
+        file_bytes: Image bytes
+        
+    Returns:
+        Corrected image bytes
+    """
+    try:
+        # Convert bytes to numpy array
+        nparr = np.frombuffer(file_bytes, np.uint8)
+        # Decode image
+        cv_image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        if cv_image is None:
+            # If OpenCV can't decode, return original bytes
+            return file_bytes
+        
+        # Apply rotation correction
+        cropper = AdvancedTableCropper()
+        rotated_image, rotation_angle = cropper.detect_and_correct_rotation(cv_image)
+        
+        if rotation_angle != 0.0:
+            print(f"Applied rotation correction: {rotation_angle:.2f} degrees")
+            # Convert back to bytes
+            _, encoded_img = cv2.imencode('.png', rotated_image)
+            return encoded_img.tobytes()
+        else:
+            return file_bytes
+    except Exception as e:
+        print(f"Rotation correction failed: {str(e)}, using original image")
+        return file_bytes
+
+
 def upload_to_tmpfiles(image_bytes: bytes, filename: str) -> str:
     """Upload image to tmpfiles.org and return the public URL"""
     try:
@@ -105,7 +143,10 @@ async def crop_and_perspective_correction(image: UploadFile = File(...)):
         if not file_bytes:
             raise HTTPException(status_code=400, detail="Empty file uploaded")
 
-        result, base_name = await _process_with_cropper(file_bytes)
+        # Apply rotation correction before processing
+        corrected_file_bytes = apply_rotation_correction(file_bytes)
+        
+        result, base_name = await _process_with_cropper(corrected_file_bytes)
 
         # Prefer perspective-corrected; fallback to cropped_table
         out_img: Image.Image = result.get("perspective_corrected") or result.get("cropped_table") or result.get("original")

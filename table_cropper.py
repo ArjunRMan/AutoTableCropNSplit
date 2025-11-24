@@ -100,6 +100,107 @@ class AdvancedTableCropper:
         reordered = sorted_corners[start_idx:] + sorted_corners[:start_idx]
         return reordered
     
+    def detect_and_correct_rotation(self, image):
+        """
+        Detect rotation angle using Hough Transform and correct the image orientation.
+        
+        Args:
+            image: OpenCV image (BGR format)
+            
+        Returns:
+            corrected_image: Rotated image with corrected orientation
+            rotation_angle: Detected rotation angle in degrees
+        """
+        # Convert to grayscale
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        
+        # Apply Gaussian blur to reduce noise
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        
+        # Edge detection
+        edges = cv2.Canny(blurred, 50, 150, apertureSize=3)
+        
+        # Use Hough Transform to detect lines
+        # Parameters: rho=1, theta=pi/180, threshold=100
+        lines = cv2.HoughLines(edges, 1, np.pi / 180, threshold=100)
+        
+        if lines is None or len(lines) == 0:
+            print("No lines detected, returning original image")
+            return image, 0.0
+        
+        # Calculate angles of detected lines
+        angles = []
+        for line in lines:
+            rho, theta = line[0]
+            # Convert theta to degrees
+            angle_deg = np.degrees(theta)
+            
+            # Normalize angle to -90 to 90 degrees range
+            if angle_deg > 90:
+                angle_deg = angle_deg - 180
+            elif angle_deg < -90:
+                angle_deg = angle_deg + 180
+            
+            # Focus on near-horizontal lines (for table rows) and near-vertical lines (for table columns)
+            # We're interested in small angles (close to 0 or 90 degrees)
+            if abs(angle_deg) < 45:  # Horizontal lines
+                angles.append(angle_deg)
+            elif abs(angle_deg) > 45:  # Vertical lines, convert to horizontal equivalent
+                angles.append(angle_deg - 90 if angle_deg > 0 else angle_deg + 90)
+        
+        if len(angles) == 0:
+            print("No valid angles detected, returning original image")
+            return image, 0.0
+        
+        # Calculate median angle (more robust than mean for outliers)
+        angles_array = np.array(angles)
+        median_angle = np.median(angles_array)
+        
+        # Filter out angles that are too large (likely noise)
+        # Only consider angles between -10 and 10 degrees
+        filtered_angles = angles_array[np.abs(angles_array) < 10]
+        
+        if len(filtered_angles) > 0:
+            rotation_angle = np.median(filtered_angles)
+        else:
+            rotation_angle = median_angle if abs(median_angle) < 10 else 0.0
+        
+        # Only rotate if the angle is significant (more than 0.5 degrees)
+        if abs(rotation_angle) < 0.5:
+            print(f"Rotation angle too small ({rotation_angle:.2f}°), skipping rotation")
+            return image, 0.0
+        
+        print(f"Detected rotation angle: {rotation_angle:.2f} degrees")
+        
+        # Get image center
+        h, w = image.shape[:2]
+        center = (w // 2, h // 2)
+        
+        # Create rotation matrix
+        rotation_matrix = cv2.getRotationMatrix2D(center, rotation_angle, 1.0)
+        
+        # Calculate new image dimensions to avoid cropping
+        cos = np.abs(rotation_matrix[0, 0])
+        sin = np.abs(rotation_matrix[0, 1])
+        new_w = int((h * sin) + (w * cos))
+        new_h = int((h * cos) + (w * sin))
+        
+        # Adjust rotation matrix for new dimensions
+        rotation_matrix[0, 2] += (new_w / 2) - center[0]
+        rotation_matrix[1, 2] += (new_h / 2) - center[1]
+        
+        # Apply rotation
+        rotated = cv2.warpAffine(
+            image, 
+            rotation_matrix, 
+            (new_w, new_h),
+            flags=cv2.INTER_LANCZOS4,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(255, 255, 255)  # White background
+        )
+        
+        return rotated, rotation_angle
+    
     def apply_perspective_correction(self, image, corners, target_width=1240, target_height=850):
         """
         Apply perspective correction using the detected corners.
