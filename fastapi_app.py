@@ -4,6 +4,7 @@ import io
 import tempfile
 from typing import Tuple
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -12,6 +13,15 @@ from starlette.responses import Response
 
 from PIL import Image
 import requests
+from supabase import create_client, Client
+
+load_dotenv()
+
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_KEY = os.environ["SUPABASE_KEY"]
+SUPABASE_BUCKET = os.environ.get("SUPABASE_BUCKET", "temp-files")
+
+_supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Ensure project root is on path to import table_cropper
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -70,31 +80,23 @@ async def _process_with_cropper(file_bytes: bytes) -> Tuple[dict, str]:
         return result, base_name
 
 
-def upload_to_tmpfiles(image_bytes: bytes, filename: str, content_type: str = "image/png") -> str:
-    """Upload image to tmpfiles.org and return the public URL"""
-    try:
-        files = {"file": (filename, image_bytes, content_type)}
-        response = requests.post("https://tmpfiles.org/api/v1/upload", files=files)
-        if response.status_code == 200:
-            data = response.json()
-            if data.get("status") == "success":
-                file_url = data.get("data", {}).get("url", "")
-                if file_url:
-                    if file_url.startswith("http://"):
-                        file_url = file_url.replace("http://", "https://")
-                    if "/dl/" not in file_url:
-                        file_url = file_url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
-                    return file_url
-        raise Exception(f"Upload failed: {response.text}")
-    except Exception as e:
-        raise Exception(f"Failed to upload to tmpfiles.org: {str(e)}")
+def upload_to_supabase(image_bytes: bytes, filename: str, content_type: str = "image/png") -> str:
+    path = f"crop-preview/{filename}"
+    _supabase.storage.from_(SUPABASE_BUCKET).upload(
+        path=path,
+        file=image_bytes,
+        file_options={"content-type": content_type, "upsert": "true"},
+    )
+    return _supabase.storage.from_(SUPABASE_BUCKET).get_public_url(path)
+
+
 
 
 @app.post("/api/crop-preview")
 async def crop_and_perspective_correction(image: UploadFile = File(...)):
     """
     API 1: Accept an image, detect corners, apply perspective correction and cropping,
-    and upload the corrected image to tmpfiles.org, returning a public URL as JSON.
+    and upload the corrected image to Supabase Storage, returning a public URL as JSON.
     """
     try:
         _validate_image_content_type(image)
@@ -123,7 +125,7 @@ async def crop_and_perspective_correction(image: UploadFile = File(...)):
         png_bytes = _pil_to_png_bytes(out_img)
         name_base = os.path.splitext(os.path.basename(image.filename or "uploaded"))[0]
         filename = f"{name_base}_preview.png"
-        url = upload_to_tmpfiles(png_bytes, filename)
+        url = upload_to_supabase(png_bytes, filename)
         return JSONResponse({"status": "success", "filename": filename, "url": url})
 
     except HTTPException:
@@ -153,21 +155,11 @@ async def split_image_halves(
             original_name = image.filename or "uploaded.png"
         elif image_url:
             try:
-                # Ensure tmpfiles links are direct download
-                url = image_url
-                if url.startswith("http://"):
-                    url = url.replace("http://", "https://")
-                if "tmpfiles.org" in url and "/dl/" not in url:
-                    url = url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
-
-                resp = requests.get(url, timeout=30)
+                resp = requests.get(image_url, timeout=30)
                 if resp.status_code != 200:
                     raise HTTPException(status_code=400, detail=f"Failed to download image: HTTP {resp.status_code}")
                 file_bytes = resp.content
-                # Derive a name from the URL
-                original_name = os.path.basename(url.split("?")[0] or "downloaded.png")
-                if not original_name:
-                    original_name = "downloaded.png"
+                original_name = os.path.basename(image_url.split("?")[0]) or "downloaded.png"
             except HTTPException:
                 raise
             except Exception as exc:
@@ -186,14 +178,12 @@ async def split_image_halves(
         top_bytes = _pil_to_png_bytes(top_half)
         bottom_bytes = _pil_to_png_bytes(bottom_half)
 
-        # File naming based on original name
-        # original_name already set above depending on source
         name_base, _ = os.path.splitext(os.path.basename(original_name))
         top_name = f"{name_base}_top_half.png"
         bottom_name = f"{name_base}_bottom_half.png"
 
-        top_url = upload_to_tmpfiles(top_bytes, top_name)
-        bottom_url = upload_to_tmpfiles(bottom_bytes, bottom_name)
+        top_url = upload_to_supabase(top_bytes, top_name)
+        bottom_url = upload_to_supabase(bottom_bytes, bottom_name)
 
         return JSONResponse({
             "status": "success",
@@ -213,7 +203,7 @@ async def upload_image_to_tmpfiles(
     image_url: str | None = Form(None),
 ):
     """
-    API 3: Accept a manually cropped image (either file upload or URL) and upload it to tmpfiles.org,
+    API 3: Accept a manually cropped image (either file upload or URL) and upload it to Supabase Storage,
     returning the public URL as JSON. This endpoint simply stores the image without any processing.
     """
     try:
@@ -228,21 +218,11 @@ async def upload_image_to_tmpfiles(
             original_name = image.filename or "uploaded.png"
         elif image_url:
             try:
-                # Ensure tmpfiles links are direct download
-                url = image_url
-                if url.startswith("http://"):
-                    url = url.replace("http://", "https://")
-                if "tmpfiles.org" in url and "/dl/" not in url:
-                    url = url.replace("tmpfiles.org/", "tmpfiles.org/dl/")
-
-                resp = requests.get(url, timeout=30)
+                resp = requests.get(image_url, timeout=30)
                 if resp.status_code != 200:
                     raise HTTPException(status_code=400, detail=f"Failed to download image: HTTP {resp.status_code}")
                 file_bytes = resp.content
-                # Derive a name from the URL
-                original_name = os.path.basename(url.split("?")[0] or "downloaded.png")
-                if not original_name:
-                    original_name = "downloaded.png"
+                original_name = os.path.basename(image_url.split("?")[0]) or "downloaded.png"
             except HTTPException:
                 raise
             except Exception as exc:
@@ -273,8 +253,7 @@ async def upload_image_to_tmpfiles(
         if not filename:
             filename = "uploaded.png"
 
-        # Upload raw image bytes directly to tmpfiles (no processing)
-        url = upload_to_tmpfiles(file_bytes, filename, content_type)
+        url = upload_to_supabase(file_bytes, filename, content_type)
 
         return JSONResponse({
             "status": "success",
